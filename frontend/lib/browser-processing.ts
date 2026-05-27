@@ -24,23 +24,69 @@ export function fileToDataUrl(file: File): Promise<string> {
   return blobToDataUrl(file);
 }
 
-// ─── Background Removal (@imgly/background-removal) ──────────────────────────
+// ─── Background Removal (HuggingFace API — no WASM, no bundling issues) ───────
 
 export async function removeBgBrowser(dataUrl: string): Promise<string> {
-  const { removeBackground } = await import("@imgly/background-removal");
+  const hfToken = process.env.NEXT_PUBLIC_HF_TOKEN ?? "";
+  if (!hfToken) return dataUrl;
+
   const blob = dataUrlToBlob(dataUrl);
-  const result = await removeBackground(blob, {
-    publicPath: "https://staticimgly.com/@imgly/background-removal/1.1.26/dist/",
-    model: "medium",
-  });
-  return blobToDataUrl(result);
+
+  // Step 1: get foreground mask from RMBG-1.4
+  const resp = await fetch(
+    "https://api-inference.huggingface.co/models/briaai/RMBG-1.4",
+    { method: "POST", headers: { Authorization: `Bearer ${hfToken}` }, body: blob }
+  );
+
+  if (!resp.ok) return dataUrl; // graceful fallback
+
+  const data = await resp.json() as Array<{ label: string; mask: string }>;
+  const fgItem = data.find((d) => d.label === "foreground") ?? data[0];
+  if (!fgItem?.mask) return dataUrl;
+
+  // Step 2: apply mask to original image using canvas
+  return applyMask(dataUrl, fgItem.mask);
 }
 
-// ─── PDF Extraction (pdfjs-dist) ─────────────────────────────────────────────
+function applyMask(originalDataUrl: string, maskDataUrl: string): Promise<string> {
+  return new Promise((resolve) => {
+    const origImg = new Image();
+    origImg.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = origImg.naturalWidth;
+      canvas.height = origImg.naturalHeight;
+      const ctx = canvas.getContext("2d")!;
+      ctx.drawImage(origImg, 0, 0);
+
+      const maskImg = new Image();
+      maskImg.onload = () => {
+        const maskCanvas = document.createElement("canvas");
+        maskCanvas.width = canvas.width;
+        maskCanvas.height = canvas.height;
+        const mCtx = maskCanvas.getContext("2d")!;
+        mCtx.drawImage(maskImg, 0, 0, canvas.width, canvas.height);
+
+        const orig = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const mask = mCtx.getImageData(0, 0, canvas.width, canvas.height);
+
+        for (let i = 0; i < orig.data.length; i += 4) {
+          orig.data[i + 3] = mask.data[i]; // use red channel of mask as alpha
+        }
+        ctx.putImageData(orig, 0, 0);
+        resolve(canvas.toDataURL("image/png"));
+      };
+      maskImg.src = maskDataUrl;
+    };
+    origImg.src = originalDataUrl;
+  });
+}
+
+// ─── PDF Extraction (pdfjs-dist v4 — CDN worker, Node 20 compatible) ─────────
 
 export async function extractPdfPages(file: File): Promise<string[]> {
   const pdfjsLib = await import("pdfjs-dist");
-  pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
+  // Use CDN worker to avoid bundling issues
+  pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
 
   const arrayBuffer = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
@@ -53,13 +99,13 @@ export async function extractPdfPages(file: File): Promise<string[]> {
     canvas.width = viewport.width;
     canvas.height = viewport.height;
     const ctx = canvas.getContext("2d")!;
-    await page.render({ canvasContext: ctx, viewport }).promise;
+    await page.render({ canvasContext: ctx as unknown as CanvasRenderingContext2D, viewport }).promise;
     pages.push(canvas.toDataURL("image/png"));
   }
   return pages;
 }
 
-// ─── SVG Conversion (imagetracerjs) ──────────────────────────────────────────
+// ─── SVG Conversion (imagetracerjs — pure JS, no WASM) ────────────────────────
 
 export async function imageToSvgBrowser(dataUrl: string): Promise<string> {
   const ImageTracer = (await import("imagetracerjs")).default;
@@ -67,28 +113,17 @@ export async function imageToSvgBrowser(dataUrl: string): Promise<string> {
     const img = new Image();
     img.onload = () => {
       const canvas = document.createElement("canvas");
-      canvas.width = img.width;
-      canvas.height = img.height;
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
       const ctx = canvas.getContext("2d")!;
       ctx.drawImage(img, 0, 0);
       const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const svgStr = ImageTracer.imagedataToSVG(imageData, {
-        ltres: 1,
-        qtres: 1,
-        pathomit: 8,
-        colorsampling: 2,
-        numberofcolors: 16,
-        mincolorratio: 0.02,
-        colorquantcycles: 3,
-        layering: 0,
-        strokewidth: 1,
-        linefilter: false,
-        scale: 1,
-        roundcoords: 1,
-        viewbox: true,
-        desc: false,
-        lcpr: 0,
-        qcpr: 0,
+      const svgStr: string = ImageTracer.imagedataToSVG(imageData, {
+        ltres: 1, qtres: 1, pathomit: 8,
+        colorsampling: 2, numberofcolors: 16,
+        mincolorratio: 0.02, colorquantcycles: 3,
+        strokewidth: 1, scale: 1, roundcoords: 1,
+        viewbox: true, desc: false,
       });
       resolve(svgStr);
     };
@@ -107,60 +142,45 @@ export async function generateChibiBrowser(
   customPrompt = ""
 ): Promise<{ result: string; warning?: string }> {
   if (!hfToken) {
-    return { result: dataUrl, warning: "No HF_TOKEN configured — showing BG-removed image" };
+    return { result: dataUrl, warning: "No HF_TOKEN — showing BG-removed image" };
   }
 
   const blob = dataUrlToBlob(dataUrl);
 
-  // Step 1: Caption the image
+  // Caption the image
   let caption = "a person";
   try {
-    const captionResp = await fetch(
+    const r = await fetch(
       `https://api-inference.huggingface.co/models/${HF_CAPTION_MODEL}`,
       { method: "POST", headers: { Authorization: `Bearer ${hfToken}` }, body: blob }
     );
-    if (captionResp.ok) {
-      const captionData = await captionResp.json();
-      caption = Array.isArray(captionData)
-        ? captionData[0]?.generated_text ?? "a person"
-        : captionData?.generated_text ?? "a person";
+    if (r.ok) {
+      const d = await r.json();
+      caption = Array.isArray(d) ? d[0]?.generated_text ?? "a person" : d?.generated_text ?? "a person";
     }
   } catch {}
 
-  // Step 2: Generate chibi
+  // Generate chibi
   const prompt = customPrompt ||
-    `chibi anime style, ${caption}, cute kawaii character, big head small body, full body, white background, simple clean lineart, pastel colors, anime chibi figurine`;
+    `chibi anime style, ${caption}, cute kawaii character, big head small body, full body, white background, simple clean lineart, pastel colors`;
   const negative = "realistic, photo, ugly, deformed, extra limbs, nsfw, text, watermark, blurry";
 
   try {
-    const genResp = await fetch(
+    const r = await fetch(
       `https://api-inference.huggingface.co/models/${HF_IMAGE_MODEL}`,
       {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${hfToken}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          inputs: prompt,
-          parameters: { negative_prompt: negative, guidance_scale: 7.5, num_inference_steps: 28 },
-        }),
+        headers: { Authorization: `Bearer ${hfToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ inputs: prompt, parameters: { negative_prompt: negative, guidance_scale: 7.5, num_inference_steps: 28 } }),
       }
     );
-
-    if (!genResp.ok) {
-      const err = await genResp.text();
-      // Model loading — return original with warning
-      if (genResp.status === 503) {
-        return { result: dataUrl, warning: "HuggingFace model is loading, try again in 20s" };
-      }
-      throw new Error(err);
+    if (!r.ok) {
+      if (r.status === 503) return { result: dataUrl, warning: "Model loading — try again in 20s" };
+      throw new Error(await r.text());
     }
-
-    const resultBlob = await genResp.blob();
-    const resultDataUrl = await blobToDataUrl(resultBlob);
-    return { result: resultDataUrl };
+    const resultBlob = await r.blob();
+    return { result: await blobToDataUrl(resultBlob) };
   } catch (e: any) {
-    return { result: dataUrl, warning: `Chibi generation failed: ${e.message}` };
+    return { result: dataUrl, warning: `Chibi failed: ${e.message}` };
   }
 }

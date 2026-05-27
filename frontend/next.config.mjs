@@ -7,11 +7,6 @@ const nextConfig = {
   basePath: isProd ? `/${repoName}` : "",
   assetPrefix: isProd ? `/${repoName}/` : "",
   images: { unoptimized: true },
-  // Required for @imgly/background-removal WASM
-  webpack: (config) => {
-    config.resolve.fallback = { ...config.resolve.fallback, fs: false };
-    return config;
-  },
 };
 
 export default nextConfig;
