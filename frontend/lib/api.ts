@@ -131,20 +131,25 @@ export async function convertToSvg(_imageData: string) { return { result: "", sv
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+type MeshyStatus = "pending" | "processing" | "succeeded" | "failed";
+
 function _parseStatus(data: Record<string, unknown>) {
-  const status = (data.status as string ?? "unknown").toLowerCase();
+  const rawStatus = ((data.status as string) ?? "pending").toLowerCase();
+  const status = (["pending", "processing", "succeeded", "failed"].includes(rawStatus)
+    ? rawStatus
+    : "pending") as MeshyStatus;
   const modelUrls = (data.model_urls ?? {}) as Record<string, string>;
   return {
-    job_id: data.id as string ?? "",
+    job_id: (data.id as string) ?? "",
     status,
-    progress: data.progress as number ?? 0,
+    progress: (data.progress as number) ?? 0,
     stl_url:       modelUrls.stl,
     glb_url:       modelUrls.glb,
     obj_url:       modelUrls.obj,
     fbx_url:       modelUrls.fbx,
     usdz_url:      modelUrls.usdz,
     "3mf_url":     modelUrls["3mf"] ?? modelUrls.stl,
-    thumbnail_url: data.thumbnail_url as string,
-    texture_urls:  data.texture_urls as string[] ?? [],
+    thumbnail_url: (data.thumbnail_url as string) ?? undefined,
+    texture_urls:  (data.texture_urls as string[]) ?? [],
   };
 }

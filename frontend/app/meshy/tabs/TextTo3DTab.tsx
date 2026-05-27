@@ -74,7 +74,7 @@ export default function TextTo3DTab() {
       await delay(4000);
       try {
         const data = await meshyTextTo3DStatus(jobId);
-        updateJob(localId, { status: data.status, progress: data.progress ?? 0, ...data });
+        updateJob(localId, { ...data });
         if (data.status === "succeeded" || data.status === "failed") break;
       } catch { break; }
     }

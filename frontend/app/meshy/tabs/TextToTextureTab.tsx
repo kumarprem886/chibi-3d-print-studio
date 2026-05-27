@@ -47,7 +47,7 @@ export default function TextToTextureTab() {
       await delay(4000);
       try {
         const data = await meshyTextToTextureStatus(jobId);
-        updateJob(localId, { status: data.status, progress: data.progress ?? 0, ...data });
+        updateJob(localId, { ...data });
         if (data.status === "succeeded" || data.status === "failed") break;
       } catch { break; }
     }
